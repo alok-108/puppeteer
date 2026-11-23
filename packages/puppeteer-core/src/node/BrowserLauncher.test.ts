@@ -11,7 +11,16 @@ import {describe, it} from 'node:test';
 
 import expect from 'expect';
 
-import {registerProcessExitCleanup} from './BrowserLauncher.js';
+import type {Browser} from '../api/Browser.js';
+import type {Connection} from '../cdp/Connection.js';
+import {Deferred} from '../util/Deferred.js';
+
+import {
+  BrowserLauncher,
+  registerProcessExitCleanup,
+  type ResolvedLaunchArgs,
+} from './BrowserLauncher.js';
+import type {PuppeteerNode} from './PuppeteerNode.js';
 
 class ProcessEmitter {
   #listeners = new Set<() => void>();
@@ -89,5 +98,131 @@ describe('registerProcessExitCleanup', () => {
 
     expect(existsSync(firstDir)).toBe(false);
     expect(existsSync(secondDir)).toBe(false);
+  });
+});
+
+class TestBrowserLauncher extends BrowserLauncher {
+  #browser: Browser;
+
+  constructor(browser: Browser) {
+    super(
+      {
+        configuration: () => {
+          return Promise.resolve({});
+        },
+      } as unknown as PuppeteerNode,
+      'chrome',
+      logger,
+    );
+    this.#browser = browser;
+  }
+
+  override async executablePath(): Promise<string> {
+    return process.execPath;
+  }
+
+  override defaultArgs(): string[] {
+    return [];
+  }
+
+  protected override async computeLaunchArguments(): Promise<ResolvedLaunchArgs> {
+    return {
+      isTempUserDataDir: false,
+      userDataDir: '',
+      executablePath: process.execPath,
+      args: ['-e', ''],
+    };
+  }
+
+  protected override async cleanUserDataDir(): Promise<void> {}
+
+  protected override async createCdpSocketConnection(): Promise<Connection> {
+    return {
+      closeBrowser: async () => {},
+    } as unknown as Connection;
+  }
+
+  protected override async createBiDiOverCdpBrowser(): Promise<Browser> {
+    return this.#browser;
+  }
+}
+
+describe('BrowserLauncher.launch', () => {
+  it('awaits enableExtensions installation before resolving', async () => {
+    const firstInstall = Deferred.create<string>();
+    const secondInstall = Deferred.create<string>();
+    const calls: Array<{
+      path: string;
+      options: {enabledInIncognito?: boolean} | undefined;
+    }> = [];
+    let settled = false;
+
+    const browser = {
+      installExtension: (
+        extensionPath: string,
+        options?: {enabledInIncognito?: boolean},
+      ) => {
+        calls.push({path: extensionPath, options});
+        if (extensionPath === '/ext/one') {
+          return firstInstall.valueOrThrow();
+        }
+        return secondInstall.valueOrThrow();
+      },
+      close: async () => {},
+    } as unknown as Browser;
+
+    const launcher = new TestBrowserLauncher(browser);
+    const launchPromise = launcher
+      .launch({
+        protocol: 'webDriverBiDi',
+        waitForInitialPage: false,
+        enableExtensions: ['/ext/one', '/ext/two'],
+        extensionsEnabledInIncognito: ['/ext/two'],
+      })
+      .finally(() => {
+        settled = true;
+      });
+
+    await new Promise(resolve => {
+      return setTimeout(resolve, 20);
+    });
+    expect(calls).toEqual([
+      {path: '/ext/one', options: {enabledInIncognito: false}},
+      {path: '/ext/two', options: {enabledInIncognito: true}},
+    ]);
+    expect(settled).toBe(false);
+
+    firstInstall.resolve('id-one');
+    await new Promise(resolve => {
+      return setTimeout(resolve, 20);
+    });
+    expect(settled).toBe(false);
+
+    secondInstall.resolve('id-two');
+    await expect(launchPromise).resolves.toBe(browser);
+    await browser.close();
+  });
+
+  it('closes the browser and rejects if installing enableExtensions fails', async () => {
+    let closed = false;
+    const browser = {
+      installExtension: async () => {
+        throw new Error('install failed');
+      },
+      close: async () => {
+        closed = true;
+      },
+    } as unknown as Browser;
+
+    const launcher = new TestBrowserLauncher(browser);
+
+    await expect(
+      launcher.launch({
+        protocol: 'webDriverBiDi',
+        waitForInitialPage: false,
+        enableExtensions: ['/ext/bad'],
+      }),
+    ).rejects.toThrow('install failed');
+    expect(closed).toBe(true);
   });
 });
